@@ -7,8 +7,12 @@ import org.openrewrite.NlsRewrite;
 import org.openrewrite.ScanningRecipe;
 import org.openrewrite.TreeVisitor;
 import org.openrewrite.java.JavaIsoVisitor;
+import org.openrewrite.java.JavaVisitor;
+import org.openrewrite.java.JavadocVisitor;
 import org.openrewrite.java.tree.J;
 import org.openrewrite.java.tree.JavaType;
+import org.openrewrite.java.tree.Javadoc;
+import org.openrewrite.marker.Markers;
 
 import java.util.HashSet;
 import java.util.LinkedHashMap;
@@ -17,6 +21,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.UUID;
 
 /**
  * Records all dependencies from any type to another, then traverses the graph starting from
@@ -25,8 +30,12 @@ import java.util.Set;
 public class EliminateUnreachableTypes extends ScanningRecipe<Map<String, EliminateUnreachableTypes.TypeModel>> {
     private final Set<String> entrypointTypes;
 
-    public EliminateUnreachableTypes(@JsonProperty("entrypointTypes") List<String> entrypointTypes) {
+    // true to respect links in javadoc, false to ignore them and rewrite where necessary
+    private final boolean checkDocumentation;
+
+    public EliminateUnreachableTypes(@JsonProperty("entrypointTypes") List<String> entrypointTypes, @JsonProperty("checkDocumentation") Boolean checkDocumentation) {
         this.entrypointTypes = Set.copyOf(entrypointTypes);
+        this.checkDocumentation = checkDocumentation != null && checkDocumentation;
     }
 
     @NlsRewrite.DisplayName
@@ -72,7 +81,9 @@ public class EliminateUnreachableTypes extends ScanningRecipe<Map<String, Elimin
                 throw new IllegalStateException("Didn't actually keep " + entrypointType);
             }
         }
-        return new EliminateUnreachableTypesVisitor(keep);
+        Set<String> remove = new LinkedHashSet<>(acc.keySet());
+        remove.removeAll(keep);
+        return new EliminateUnreachableTypesVisitor(keep, remove);
     }
 
     private void recordDependencies(Map<String, TypeModel> acc, Set<String> keep, Set<JavaType.Class> types) {
@@ -119,6 +130,20 @@ public class EliminateUnreachableTypes extends ScanningRecipe<Map<String, Elimin
         }
 
         @Override
+        protected JavadocVisitor<ExecutionContext> getJavadocVisitor() {
+            if (checkDocumentation) {
+                return super.getJavadocVisitor();
+            }
+
+            return new JavadocVisitor<>(new JavaVisitor<>()) {
+                @Override
+                public Javadoc visitReference(Javadoc.Reference reference, ExecutionContext executionContext) {
+                    return super.visitReference(reference, executionContext);
+                }
+            };
+        }
+
+        @Override
         public J.CompilationUnit visitCompilationUnit(J.CompilationUnit cu, ExecutionContext executionContext) {
             assert inCompilationUnit.isEmpty();
             J.CompilationUnit compilationUnit = super.visitCompilationUnit(cu, executionContext);
@@ -160,10 +185,85 @@ public class EliminateUnreachableTypes extends ScanningRecipe<Map<String, Elimin
     }
 
     public class EliminateUnreachableTypesVisitor extends JavaIsoVisitor<ExecutionContext> {
-        private final Set<String> keep;
+        private class EliminatedPrunedJavadocRefsVisitor extends JavaVisitor<ExecutionContext> {
+            private boolean pruneCurrentReference = false;
+            private class JavadocRefVisitor extends JavadocVisitor<ExecutionContext> {
 
-        public EliminateUnreachableTypesVisitor(Set<String> keep) {
+                public JavadocRefVisitor() {
+                    super(EliminatedPrunedJavadocRefsVisitor.this);
+                }
+
+                @Override
+                public Javadoc visitLink(Javadoc.Link link, ExecutionContext executionContext) {
+                    pruneCurrentReference = false;
+                    Javadoc.Link result = (Javadoc.Link) super.visitLink(link, executionContext);
+                    if (pruneCurrentReference) {
+                        return new Javadoc.Text(UUID.randomUUID(), Markers.EMPTY, result.getTreeReference().getTree().toString());
+                    }
+                    return result;
+                }
+
+                @Override
+                public Javadoc visitSee(Javadoc.See see, ExecutionContext executionContext) {
+                    pruneCurrentReference = false;
+                    Javadoc result = super.visitSee(see, executionContext);
+
+                    if (pruneCurrentReference) {
+                        return new Javadoc.Text(UUID.randomUUID(), Markers.EMPTY, see.getTreeReference().getTree().toString());
+                    }
+                    return result;
+                }
+            }
+
+            @Override
+            @Nullable
+            public JavaType visitType(@Nullable JavaType javaType, ExecutionContext executionContext) {
+                if (javaType == null) {
+                    return null;
+                }
+                JavaType type = super.visitType(javaType, executionContext);
+                if (type instanceof JavaType.Primitive || type instanceof JavaType.Unknown || type instanceof JavaType.GenericTypeVariable) {
+                    // no child nodes that we care about
+                    return type;
+                } else if (type instanceof JavaType.Method) {
+                    // visit types in the method sig, but don't worry about return value, just make sure we prune
+                    // if anything is unreachable after this recipe
+                    visitType(((JavaType.Method) type).getReturnType(), executionContext);
+                    for (JavaType param : ((JavaType.Method) type).getParameterTypes()) {
+                        visitType(param, executionContext);
+                    }
+                    return type;
+                } else if (type instanceof JavaType.Variable) {
+                    visitType(((JavaType.Variable) type).getType(), executionContext);
+                    return type;
+                } else if (type instanceof JavaType.Array) {
+                    visitType(((JavaType.Array) type).getElemType(), executionContext);
+                    return type;
+                }
+                Optional<JavaType.Class> raw = raw(type);
+                if (remove.contains(raw.get().getFullyQualifiedName())) {
+                    pruneCurrentReference = true;
+                }
+                return type;
+            }
+        }
+
+        private final Set<String> keep;
+        // Whereas "keep" is the set of types that should exist in this project after this pass completes, the "remove"
+        // list might contain types we can't actually remove. Used only for javadoc reference rewrites.
+        private final Set<String> remove;
+
+        public EliminateUnreachableTypesVisitor(Set<String> keep, Set<String> remove) {
             this.keep = keep;
+            this.remove = remove;
+        }
+
+        @Override
+        protected JavadocVisitor<ExecutionContext> getJavadocVisitor() {
+            if (checkDocumentation) {
+                return super.getJavadocVisitor();
+            }
+            return new EliminatedPrunedJavadocRefsVisitor().new JavadocRefVisitor();
         }
 
         @Override
