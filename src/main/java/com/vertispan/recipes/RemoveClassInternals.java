@@ -11,12 +11,13 @@ import org.openrewrite.internal.ListUtils;
 import org.openrewrite.java.JavaIsoVisitor;
 import org.openrewrite.java.JavaTemplate;
 import org.openrewrite.java.tree.J;
+import org.openrewrite.java.tree.Statement;
 
 /**
  * Rewrites a class to do nothing - all public methods and constructors throw, all private members are removed.
  * Useful for when a class is used in many other APIs, but will either never actually be used, or null can
  * be passed instead.
- *
+ * <p>
  * Similar to calling MethodThrowsException with {@code fully.qualified.ClassName *(..)}, but will also specifically
  * remove private methods and fields.
  */
@@ -69,6 +70,22 @@ public class RemoveClassInternals extends Recipe {
             public J.MethodDeclaration visitMethodDeclaration(J.MethodDeclaration method, ExecutionContext executionContext) {
                 J.ClassDeclaration classDecl = getCursor().firstEnclosing(J.ClassDeclaration.class);
                 if (classDecl.getType() != null && classDecl.getType().getFullyQualifiedName().equals(fullyQualifiedClassName)) {
+                    // Rewrite constructors to have their name, and to still call super/this first
+                    if (method.isConstructor() && method.getBody() != null && !method.getBody().getStatements().isEmpty()) {
+                        String exWithClassName = "throw new UnsupportedOperationException(\"" + classDecl.getSimpleName() + "\")";
+
+                        if (method.getBody().getStatements().get(0) instanceof J.MethodInvocation) {
+                            J.MethodInvocation call = (J.MethodInvocation) method.getBody().getStatements().get(0);
+                            if (call.getName().getSimpleName().equals("this") || call.getName().getSimpleName().equals("super")) {
+                                // This is pretty dirty, but I'm not clear how to insert a statement as an arg to the builder
+                                return JavaTemplate.builder(call + "; " + exWithClassName)
+                                        .build()
+                                        .apply(getCursor(), method.getCoordinates().replaceBody());
+                            }
+                        }
+                        return JavaTemplate.builder(exWithClassName).build()
+                                .apply(getCursor(), method.getCoordinates().replaceBody());
+                    }
                     final JavaTemplate replacementTemplate = JavaTemplate
                             .builder("throw new UnsupportedOperationException(\"" + method.getSimpleName() + "\")")
                             .build();
