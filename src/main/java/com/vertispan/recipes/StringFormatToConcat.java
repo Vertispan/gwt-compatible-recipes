@@ -10,16 +10,11 @@ import org.openrewrite.java.MethodMatcher;
 import org.openrewrite.java.tree.CoordinateBuilder;
 import org.openrewrite.java.tree.Expression;
 import org.openrewrite.java.tree.J;
-import org.openrewrite.java.tree.JavaType;
-import org.openrewrite.java.tree.Space;
-import org.openrewrite.marker.Markers;
 
 import java.util.List;
 import java.util.Optional;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
-
-import static org.openrewrite.Tree.randomId;
 
 /**
  * Rewrite all calls to String.format(). Currently only supports %s, %d, etc, and rewrites to plain concatenation
@@ -29,16 +24,42 @@ public class StringFormatToConcat extends Recipe {
     private static final MethodMatcher FORMAT_MATCHER = new MethodMatcher("java.lang.String format(java.lang.String,..)");
     private static final MethodMatcher FORMAT_LOCALE_MATCHER = new MethodMatcher("java.lang.String format(java.util.Locale,java.lang.String,..)");
 
+    private static final String ARG_INDEX = "(?:([0-9]+)\\$)?";
+    private static final String FLAGS = "(-#\\+ 0,\\()?";
+    private static final String WIDTH = "([0-9]+)?";
+    private static final String PRECISION = "(?:\\.([0-9]+))?";
+    private static final String CONVERSION = "(" +
+            "[bB]|" + //boolean
+            "[hH]|" +// hex of hashcode
+            "[sS]|" +// call formatTo or toString
+            "[cC]|" +// character
+            "d|" + // decimal integer
+            "o|" + // octal integer
+            "[xX]|" +// hexadecimal integer
+            "[eE]|" +// decimal in scientific notation
+            "f|" + // decimal floating point
+            "[gG]|" +// decimal floating point, possibly in scientific notation
+            "[aA]|" +// floating point in hex with exponent
+            "[tT][HIklMSLNpzZsQBbhAaCYyjmdeRTrDFc]+|" +// prefix for datetime, all suffixes
+            "%|" + // literal percent
+            "n)";  // literal newline
+    private static final Pattern FORMAT_SPECIFIER = Pattern.compile("%" +
+            ARG_INDEX + // argument index, optional
+            FLAGS +     // flags, optional
+            WIDTH +     // width, optional
+            PRECISION + // precision, optional
+            CONVERSION);// conversion type (plus datetime pattern, not yet supported)
+
     @NlsRewrite.DisplayName
     @Override
     public String getDisplayName() {
-        return "String.format() to string concatenation";
+        return "Rewrite String.format() to string concatenation";
     }
 
     @NlsRewrite.Description
     @Override
     public String getDescription() {
-        return "Rewrites away String.format() calls, as not compatible with GWT. Locale will be ignored, and only %n formats will be handled, others will be ignored";
+        return "Rewrites away String.format() calls, as not compatible with GWT. Locale will be ignored, and all conversions are treated as toString";
     }
 
     @Override
@@ -52,7 +73,6 @@ public class StringFormatToConcat extends Recipe {
                     String formatStr = getConstantStringFromExpression(method.getArguments().get(0))
                             .orElseThrow(() -> new IllegalStateException("String.format()'s format pattern must be a literal string"));
                     return replace(formatStr, args, method.getCoordinates());
-
                 } else if (FORMAT_LOCALE_MATCHER.matches(method)) {
                     // For the locale version, we ignore the locale and just use the format string
                     List<Expression> args = method.getArguments().subList(2, method.getArguments().size());
@@ -69,7 +89,7 @@ public class StringFormatToConcat extends Recipe {
                         .replace("\n", "\\n")// Escape newlines
                         .replace("\r", "\\r") // Escape carriage returns
                         .replace("\"", "\\\""); // Escape double quotes
-                Matcher matcher = Pattern.compile("%[a-z]").matcher(formatStr);
+                Matcher matcher = FORMAT_SPECIFIER.matcher(formatStr);
                 StringBuilder sb = new StringBuilder("\"");
                 while (matcher.find()) {
                     matcher.appendReplacement(sb, "\" + #{any()} + \"");
